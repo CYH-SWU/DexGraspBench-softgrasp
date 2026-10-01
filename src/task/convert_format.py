@@ -117,6 +117,46 @@ def Learning(params):
     np.save(save_path, new_data)
     return
 
+def Learning(params):
+    data_file, configs = params[0], params[1]
+    raw_data = np.load(data_file, allow_pickle=True).item()
+    scene_cfg = load_scene_cfg(raw_data["scene_path"])
+    target_obj = scene_cfg["task"]["obj_name"]
+
+    grasp_qpos = raw_data["grasp_qpos"]
+
+    if grasp_qpos.ndim == 1:
+        # 单条抓取：直接保存
+        new_data = {}
+        new_data["obj_path"] = os.path.dirname(
+            os.path.dirname(scene_cfg["scene"][target_obj]["file_path"])
+        )
+        new_data["obj_pose"] = scene_cfg["scene"][target_obj]["pose"]
+        new_data["obj_scale"] = scene_cfg["scene"][target_obj]["scale"][0]
+        new_data["grasp_qpos"] = raw_data["grasp_qpos"]
+        new_data["pregrasp_qpos"] = raw_data["pregrasp_qpos"]
+        new_data["squeeze_qpos"] = raw_data["squeeze_qpos"]
+        save_path = data_file.replace(configs.task.data_path, configs.grasp_dir)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        np.save(save_path, new_data)
+    else:
+        # 批量抓取：逐条拆分保存
+        save_base = data_file.replace(configs.task.data_path, configs.grasp_dir)
+        for i in range(grasp_qpos.shape[0]):
+            new_data = {}
+            new_data["obj_path"] = os.path.dirname(
+                os.path.dirname(scene_cfg["scene"][target_obj]["file_path"])
+            )
+            new_data["obj_pose"] = scene_cfg["scene"][target_obj]["pose"]
+            new_data["obj_scale"] = scene_cfg["scene"][target_obj]["scale"][0]
+            new_data["grasp_qpos"] = raw_data["grasp_qpos"][i]
+            new_data["pregrasp_qpos"] = raw_data["pregrasp_qpos"][i]
+            new_data["squeeze_qpos"] = raw_data["squeeze_qpos"][i]
+
+            save_path = os.path.join(save_base.split(".npy")[0], f"{i}.npy")
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            np.save(save_path, new_data)
+    return
 
 def Batched(params):
     data_file, configs = params[0], params[1]

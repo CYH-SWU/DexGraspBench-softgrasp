@@ -5,6 +5,9 @@ debug_render: False
 debug_viewer: False
 debug_dir: ${save_dir}/debug
 
+collect_data: False
+sample_hz: 30
+
 simulation_metrics: 
   max_pene: 0.01  # If the initial hand penetrates the object too much, regard it as a failure
   trans_thre: 0.05

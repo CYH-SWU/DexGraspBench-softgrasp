@@ -1,5 +1,5 @@
 import os
-import pdb
+import time
 
 import trimesh
 import numpy as np
@@ -10,6 +10,76 @@ import transforms3d.quaternions as tq
 from .rot_util import interplote_pose, interplote_qpos
 
 
+# ====================================================================
+# 模块级工具函数
+# ====================================================================
+def camera_look_at(pos, target=(0.0, 0.0, 0.0), world_up=(0.0, 0.0, 1.0)):
+    """返回 (pos, xyaxes)，让相机从 pos 看向 target。
+
+    MuJoCo 相机沿自身 -z 轴看。z 轴 = x × y。
+    """
+    pos = np.asarray(pos, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    world_up = np.asarray(world_up, dtype=np.float64)
+
+    z_axis = pos - target
+    z_axis /= np.linalg.norm(z_axis) + 1e-12
+
+    x_axis = np.cross(world_up, z_axis)
+    if np.linalg.norm(x_axis) < 1e-6:
+        x_axis = np.cross(np.array([0, 1, 0]), z_axis)
+    x_axis /= np.linalg.norm(x_axis) + 1e-12
+
+    y_axis = np.cross(z_axis, x_axis)
+
+    return pos.tolist(), np.concatenate([x_axis, y_axis]).tolist()
+
+
+def quat_slerp(q1, q2, t):
+    """四元数球面线性插值。q 格式 [w, x, y, z]。"""
+    q1 = np.asarray(q1, dtype=np.float64)
+    q2 = np.asarray(q2, dtype=np.float64)
+
+    q1 = q1 / (np.linalg.norm(q1) + 1e-12)
+    q2 = q2 / (np.linalg.norm(q2) + 1e-12)
+
+    dot = np.dot(q1, q2)
+    if dot < 0.0:
+        q2 = -q2
+        dot = -dot
+
+    if dot > 0.9995:
+        res = q1 + t * (q2 - q1)
+        return res / (np.linalg.norm(res) + 1e-12)
+
+    theta_0 = np.arccos(np.clip(dot, -1.0, 1.0))
+    sin_theta_0 = np.sin(theta_0)
+    theta = theta_0 * t
+    sin_theta = np.sin(theta)
+
+    s0 = np.sin(theta_0 - theta) / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return s0 * q1 + s1 * q2
+
+
+def s_curve(t, T, kind="quintic"):
+    """归一化 S 曲线：s(0)=0, s(T)=1。"""
+    if t <= 0:
+        return 0.0
+    if t >= T:
+        return 1.0
+    x = t / T
+    if kind == "quintic":
+        return 10 * x**3 - 15 * x**4 + 6 * x**5
+    elif kind == "cosine":
+        return 0.5 * (1.0 - np.cos(np.pi * x))
+    else:
+        raise ValueError(f"Unknown S-curve kind: {kind}")
+
+
+# ====================================================================
+# MjHO
+# ====================================================================
 class MjHO:
 
     hand_prefix: str = "child-"
@@ -33,6 +103,7 @@ class MjHO:
         self.spec.option.timestep = 0.004
         self.spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
         self.spec.option.disableflags = mujoco.mjtDisableBit.mjDSBL_GRAVITY
+
         if debug_render or debug_viewer:
             self.spec.add_texture(
                 type=mujoco.mjtTexture.mjTEXTURE_SKYBOX,
@@ -47,9 +118,29 @@ class MjHO:
                 pos=[0, -1, 2],
                 castshadow=False,
             )
+
+            # ---------- 4 相机环绕 ----------
+            RADIUS = 0.6
+            HEIGHT = 0.4
+            TARGET = [0.0, 0.0, 0.0]
+
+            self.cam_names = ["cam_front", "cam_right", "cam_back", "cam_left"]
+            for name, deg in zip(self.cam_names, [0, 90, 180, 270]):
+                theta = np.radians(deg)
+                pos = [RADIUS * np.cos(theta), RADIUS * np.sin(theta), HEIGHT]
+                pos, xyaxes = camera_look_at(pos, target=TARGET)
+                self.spec.worldbody.add_camera(
+                    name=name, pos=pos, xyaxes=xyaxes, fovy=60,
+                )
+
+            # 保留原 closeup（斜上视角）
             self.spec.worldbody.add_camera(
-                name="closeup", pos=[0.75, 1.0, 1.0], xyaxes=[-1, 0, 0, 0, -1, 1]
+                name="closeup",
+                pos=[0.75, 1.0, 1.0],
+                xyaxes=[-1, 0, 0, 0, -1, 1],
             )
+        else:
+            self.cam_names = []
 
         self._add_hand(hand_xml_path, hand_mocap)
         self._add_object(obj_path, obj_scale, obj_density, has_floor_z0)
@@ -58,7 +149,8 @@ class MjHO:
         if exclude_table_contact is not None:
             for body_name in exclude_table_contact:
                 self.spec.add_exclude(
-                    bodyname1="world", bodyname2=f"{self.hand_prefix}{body_name}"
+                    bodyname1="world",
+                    bodyname2=f"{self.hand_prefix}{body_name}",
                 )
 
         # Get ready for simulation
@@ -81,32 +173,73 @@ class MjHO:
 
         self.debug_viewer = None
         self.debug_render = None
+
+        # ------------------------------------------------------------------
+        # 实时 viewer
+        # ------------------------------------------------------------------
         if debug_viewer:
             self.debug_viewer = mujoco.viewer.launch_passive(self.model, self.data)
+            with self.debug_viewer.lock():
+                opt = self.debug_viewer.opt
+                opt.geomgroup[:] = [1, 1, 1, 0, 0, 0]
+                opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = False
+                opt.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
+                opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+                opt.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = False
+                opt.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = False
+                opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = False
             self.debug_viewer.sync()
-            pdb.set_trace()
 
+        # ------------------------------------------------------------------
+        # 离屏渲染
+        # ------------------------------------------------------------------
         if debug_render:
             self.debug_render = mujoco.Renderer(self.model, 480, 640)
             self.debug_options = mujoco.MjvOption()
             mujoco.mjv_defaultOption(self.debug_options)
-            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = True
-            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = True
+            self.debug_options.geomgroup[:] = [1, 1, 1, 0, 0, 0]
+            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_CONTACTPOINT] = False
+            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_CONTACTFORCE] = False
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
-            self.debug_images = []
+            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = False
+            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = False
+            self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_COM] = False
+            # ★ 改成 dict，每路一个 list
+            self.debug_images = {name: [] for name in self.cam_names}
         return
 
+    def __del__(self):
+        try:
+            v = getattr(self, "debug_viewer", None)
+            if v is not None:
+                try:
+                    v.close()
+                except Exception:
+                    pass
+                self.debug_viewer = None
+        except Exception:
+            pass
+        try:
+            r = getattr(self, "debug_render", None)
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                self.debug_render = None
+        except Exception:
+            pass
+
+    # ==================================================================
+    # 场景构建
+    # ==================================================================
     def _add_hand(self, xml_path, mocap_base):
-        # Read hand xml
         child_spec = mujoco.MjSpec.from_file(xml_path)
         for m in child_spec.meshes:
             m.file = os.path.join(os.path.dirname(xml_path), child_spec.meshdir, m.file)
         child_spec.meshdir = self.spec.meshdir
 
         for g in child_spec.geoms:
-            # This solimp and solref comes from the Shadow Hand xml
-            # They can generate larger force with smaller penetration
-            # The body will be more "rigid" and less "soft"
             g.solimp[:3] = [0.5, 0.99, 0.0001]
             g.solref[:2] = [0.005, 1]
 
@@ -114,7 +247,6 @@ class MjHO:
         child_world = attach_frame.attach_body(
             child_spec.worldbody, self.hand_prefix, ""
         )
-        # Add freejoint and mocap of hand root
         if mocap_base:
             child_world.add_freejoint(name="hand_freejoint")
             self.spec.worldbody.add_body(name="mocap_body", mocap=True)
@@ -130,11 +262,12 @@ class MjHO:
 
     def _add_object(self, obj_path, obj_scale, obj_density, has_floor_z0):
         if has_floor_z0:
-            floor_geom = self.spec.worldbody.add_geom(
+            self.spec.worldbody.add_geom(
                 name="object_collision_floor",
                 type=mujoco.mjtGeom.mjGEOM_PLANE,
                 pos=[0, 0, 0],
                 size=[0, 0, 1.0],
+                group=3,
             )
 
         obj_body = self.spec.worldbody.add_body(name="object")
@@ -157,14 +290,15 @@ class MjHO:
                 density=0,
                 contype=0,
                 conaffinity=0,
+                group=2,
             )
             obj_body.add_geom(
                 name=f"object_collision_{mesh_id}",
                 type=mujoco.mjtGeom.mjGEOM_MESH,
                 meshname=mesh_name,
                 density=obj_density,
+                group=3,
             )
-
         return
 
     def _set_friction(self, test_friction):
@@ -176,6 +310,9 @@ class MjHO:
             g.condim = 4
         return
 
+    # ==================================================================
+    # 状态访问
+    # ==================================================================
     def _qpos2ctrl(self, hand_qpos):
         if self.hand_mocap:
             return self._qpos2ctrl_matrix[:, 6:] @ hand_qpos[7:]
@@ -186,19 +323,16 @@ class MjHO:
         return self.data.qpos[-7:]
 
     def get_contact_info(self, hand_qpos, obj_pose, obj_margin=0):
-        # Set margin and gap to detect contact
         for i in range(self.model.ngeom):
             if "object_collision" in self.model.geom(i).name:
                 self.model.geom_margin[i] = self.model.geom_gap[i] = obj_margin
 
-        # Set pose and qpos for hand and object
         self.reset_pose_qpos(hand_qpos, obj_pose)
 
         object_id = self.model.nbody - 1
         hand_id = self.model.nbody - 2
         world_id = -1 if self.hand_mocap else 0
 
-        # Processing all contact information
         ho_contact = []
         hh_contact = []
         for contact in self.data.contact:
@@ -206,11 +340,10 @@ class MjHO:
             body2_id = self.model.geom(contact.geom2).bodyid
             body1_name = self.model.body(self.model.geom(contact.geom1).bodyid).name
             body2_name = self.model.body(self.model.geom(contact.geom2).bodyid).name
-            # hand and object
+
             if (
                 body1_id > world_id and body1_id < hand_id and body2_id == object_id
             ) or (body2_id > world_id and body2_id < hand_id and body1_id == object_id):
-                # keep body1=hand and body2=object
                 if body2_id == object_id:
                     contact_normal = contact.frame[0:3]
                     hand_body_name = body1_name.removeprefix(self.hand_prefix)
@@ -228,7 +361,6 @@ class MjHO:
                         "body2_name": obj_body_name,
                     }
                 )
-            # hand and hand
             elif (
                 body1_id > world_id
                 and body1_id < hand_id
@@ -244,10 +376,7 @@ class MjHO:
                         "body2_name": body2_name,
                     }
                 )
-            # else:
-            #     print(body1_name, body2_name, body1_id, body2_id)
 
-        # Set margin and gap back
         for i in range(self.model.ngeom):
             if "object_collision" in self.model.geom(i).name:
                 self.model.geom_margin[i] = self.model.geom_gap[i] = 0
@@ -258,7 +387,6 @@ class MjHO:
         return
 
     def reset_pose_qpos(self, hand_qpos, obj_pose):
-        # set key frame
         self.model.key_qpos[0] = np.concatenate([hand_qpos, obj_pose], axis=0)
         self.model.key_ctrl[0] = self._qpos2ctrl(hand_qpos)
         self.model.key_qvel[0] = 0
@@ -271,6 +399,25 @@ class MjHO:
         mujoco.mj_forward(self.model, self.data)
         return
 
+    # ==================================================================
+    # 渲染
+    # ==================================================================
+    def _render_all_cameras(self):
+        """渲染所有 cam_names 里的相机，返回 {cam_name: HxWx3 uint8}。
+
+        无 debug_render 时返回 None。
+        """
+        if self.debug_render is None:
+            return None
+        frames = {}
+        for cam_name in self.cam_names:
+            self.debug_render.update_scene(self.data, cam_name, self.debug_options)
+            frames[cam_name] = self.debug_render.render().copy()
+        return frames
+
+    # ==================================================================
+    # 控制
+    # ==================================================================
     def control_hand_with_interp(
         self, hand_qpos1, hand_qpos2, step_outer=10, step_inner=10
     ):
@@ -289,19 +436,121 @@ class MjHO:
         return
 
     def control_hand_step(self, step_inner):
+        target_sync_dt = self.model.opt.timestep
+
         for _ in range(step_inner):
+            t0 = time.time()
             mujoco.mj_step(self.model, self.data)
 
-        if self.debug_render is not None:
-            self.debug_render.update_scene(self.data, "closeup", self.debug_options)
-            pixels = self.debug_render.render()
-            self.debug_images.append(pixels)
+            v = self.debug_viewer
+            if v is not None:
+                try:
+                    if not v.is_running():
+                        self.debug_viewer = None
+                    else:
+                        v.cam.lookat[:] = self.data.qpos[-7:-4]
+                        v.sync()
+                        elapsed = time.time() - t0
+                        if elapsed < target_sync_dt:
+                            time.sleep(target_sync_dt - elapsed)
+                except Exception:
+                    self.debug_viewer = None
 
-        if self.debug_viewer is not None:
-            raise NotImplementedError
+        # 离屏渲染（多路）
+        frames = self._render_all_cameras()
+        if frames is not None:
+            for cam_name, frame in frames.items():
+                self.debug_images[cam_name].append(frame)
+        return
+
+    def control_hand_with_s_curve(
+        self,
+        hand_qpos1,
+        hand_qpos2,
+        duration=1.0,
+        kind="quintic",
+        record_hook=None,
+        phase_name="",
+        realtime_factor=1.0,
+    ):
+        """S 曲线在 hand_qpos1 → hand_qpos2 之间平滑过渡（qpos 空间）。
+
+        realtime_factor:
+            1.0  → 实时（1 秒仿真对应 1 秒墙钟）
+            0.5  → 2 倍慢放
+            0.0  → 不限速（批量采集用，最快）
+        """
+        dt = self.model.opt.timestep
+        n_steps = max(2, int(round(duration / dt)))
+
+        q1 = np.asarray(hand_qpos1, dtype=np.float64).copy()
+        q2 = np.asarray(hand_qpos2, dtype=np.float64).copy()
+
+        for i in range(n_steps + 1):
+            step_t0 = time.time()
+            t = i * dt
+            s = s_curve(t, duration, kind=kind)
+
+            if self.hand_mocap:
+                pos_i = (1.0 - s) * q1[:3] + s * q2[:3]
+                quat_i = quat_slerp(q1[3:7], q2[3:7], s)
+                joints_i = (1.0 - s) * q1[7:] + s * q2[7:]
+
+                self.data.mocap_pos[0] = pos_i
+                self.data.mocap_quat[0] = quat_i
+                full_qpos = np.concatenate([pos_i, quat_i, joints_i])
+                self.data.ctrl[:] = self._qpos2ctrl(full_qpos)
+            else:
+                full_qpos = (1.0 - s) * q1 + s * q2
+                self.data.ctrl[:] = self._qpos2ctrl(full_qpos)
+
+            mujoco.mj_forward(self.model, self.data)
+            mujoco.mj_step(self.model, self.data)
+
+            # ★ 先问 recorder：本步是否需要采样（避免 250Hz 渲染）
+            need_render = False
+            if record_hook is not None and self.debug_render is not None:
+                if hasattr(record_hook, "should_sample"):
+                    need_render = record_hook.should_sample(self)
+                else:
+                    # 非 recorder 的 hook，保守每步都渲染
+                    need_render = getattr(record_hook, "recording", True)
+
+            frames = None
+            if need_render:
+                frames = self._render_all_cameras()
+
+            # ★ 传给 record_hook
+            if record_hook is not None:
+                record_hook(
+                    t=t, s=s, mj_ho=self,
+                    phase_name=phase_name,
+                    frames=frames,
+                )
+
+            # viewer 同步 + 限速
+            v = self.debug_viewer
+            if v is not None:
+                try:
+                    if not v.is_running():
+                        self.debug_viewer = None
+                    else:
+                        v.cam.lookat[:] = self.data.qpos[-7:-4]
+                        v.sync()
+
+                        if realtime_factor > 1e-6:
+                            target = dt / realtime_factor
+                            elapsed = time.time() - step_t0
+                            if elapsed < target:
+                                time.sleep(target - elapsed)
+                except Exception:
+                    self.debug_viewer = None
         return
 
 
+# ====================================================================
+# RobotKinematics
+# ====================================================================
 class RobotKinematics:
     def __init__(self, xml_path):
         spec = mujoco.MjSpec.from_file(xml_path)
@@ -327,7 +576,6 @@ class RobotKinematics:
                     "face": face,
                     "geom_id": i,
                 }
-
         return
 
     def forward_kinematics(self, q):
