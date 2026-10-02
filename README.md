@@ -6,6 +6,8 @@
 
 ```bash
 ~/my_project/
+├── data
+│   └── index.json                # BC训练数据访问
 ├── DexGraspBench/                # 本仓库
 └── bodex_data/                   # 数据源（需自行下载）
     ├── DGN_2k/                   # 物体资产
@@ -13,7 +15,7 @@
     │   ├── scene_cfg/
     │   └── valid_split/
     └── bodex_shadow/
-        └── succ_collect/         # 成功抓取数据（9588 个 .npy，2397 个物体）
+        └── succ_collect/
             └── <物体名>/floating/scale0XX.npy
 ```
 
@@ -27,7 +29,7 @@ ln -sfn ~/my_project/bodex_data/DGN_2k assets/object/DGN_2k
 # 2. 转换抓取数据（一次性，约 10-30 分钟）
 python src/main.py task=format exp_name=debug \
     task.data_name=Learning \
-    task.data_path=/home/$USER/my_project/bodex_data/bodex_shadow/succ_collect \
+    task.data_path=/xxx/xxx/my_project/bodex_data/bodex_shadow/succ_collect \
     n_worker=16
 
 # 3. 建采集目录 + 软链数据源
@@ -142,41 +144,6 @@ python scripts/build_index.py \
     --exp collect_data \
     --success-only \
     --out ~/my_project/data/index_data.json
-```
-
-### 生成 stats.json
-```bash
-python - << 'EOF'
-import json
-import numpy as np
-
-INDEX = '/home/chen/my_project/data/index_data.json'
-OUT = '/home/chen/my_project/data/stats_data.json'
-
-idx = json.load(open(INDEX))
-qpos_all, qfrc_all = [], []
-
-for e in idx['episodes']:
-    if e['split'] != 'train' or not e['success']:
-        continue
-    d = np.load(e['npz'], allow_pickle=True)
-    qpos_all.append(d['qpos_hand'])
-    qfrc_all.append(d['qfrc_hand'])
-
-qpos_all = np.concatenate(qpos_all)
-qfrc_all = np.concatenate(qfrc_all)
-
-stats = {
-    'qpos_mean': qpos_all.mean(0).tolist(),
-    'qpos_std': (qpos_all.std(0) + 1e-6).tolist(),
-    'qfrc_mean': qfrc_all.mean(0).tolist(),
-    'qfrc_std': (qfrc_all.std(0) + 1e-6).tolist(),
-    'n_train_frames': int(len(qpos_all)),
-}
-json.dump(stats, open(OUT, 'w'), indent=2)
-print(f"saved {OUT}")
-print(f"n_train_frames = {stats['n_train_frames']}")
-EOF
 ```
 
 ---
