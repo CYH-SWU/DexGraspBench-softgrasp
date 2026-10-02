@@ -7,7 +7,7 @@
 ```bash
 ~/my_project/
 ├── data
-│   └── index.json                # BC训练数据访问
+│   └── index.json                # 数据清单
 ├── DexGraspBench/                # 本仓库
 └── bodex_data/                   # 数据源（需自行下载）
     ├── DGN_2k/                   # 物体资产
