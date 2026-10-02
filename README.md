@@ -20,6 +20,7 @@
 ## 首次配置
 ```bash
 # 1. 软链物体资产到仓库
+cd ~/my_project/DexGraspBench
 mkdir -p assets/object
 ln -sfn ~/my_project/bodex_data/DGN_2k assets/object/DGN_2k
 
@@ -55,6 +56,132 @@ python src/main.py task=eval exp_name=collect_data \
     task.max_num=100
 ```
 
+---
+
+## 完整流程
+
+### 建实验目录 + 软链
+```bash
+EXP=collect_data
+mkdir -p output/${EXP}_shadow
+
+ln -sfn /xxx/xxx/my_project/DexGraspBench/output/debug_shadow/graspdata \
+        /xxx/xxx/my_project/DexGraspBench/output/${EXP}_shadow/graspdata
+
+find -L output/${EXP}_shadow/graspdata -name "*.npy" | wc -l
+```
+
+### 后台采集
+```bash
+cd ~/my_project/DexGraspBench
+mkdir -p logs
+
+nohup python src/main.py task=eval exp_name=collect_data \
+    setting=collect \
+    task.debug_render=True \
+    task.collect_data=True \
+    task.max_num=1339 \
+    skip=False \
+    > logs/collect_data.log 2>&1 &
+
+echo "采集 PID: $!"
+echo "监控: tail -f logs/collect_data.log"
+```
+
+### 监控（另开终端）
+```bash
+# 实时日志
+tail -f ~/my_project/DexGraspBench/logs/collect_data.log
+
+# 已采条数
+watch -n 30 'find ~/my_project/DexGraspBench/output/collect_data_shadow/dataset -name "*.npz" 2>/dev/null | wc -l'
+
+# 磁盘占用
+watch -n 60 'du -sh ~/my_project/DexGraspBench/output/collect_data_shadow/dataset 2>/dev/null'
+```
+
+### 后台评测(采集完成后)
+```bash
+cd ~/my_project/DexGraspBench
+
+nohup python src/main.py task=eval exp_name=collect_data \
+    setting=fc \
+    task.max_num=1339 \
+    > logs/eval_data.log 2>&1 &
+
+echo "评测 PID: $!"
+echo "监控: tail -f logs/eval_data.log"
+```
+
+### 验证
+```bash
+cd ~/my_project/DexGraspBench
+
+echo "=== dataset ==="
+find output/collect_data_shadow/dataset -name "*.npz" | wc -l
+
+echo "=== evaluation ==="
+find output/collect_data_shadow/evaluation -name "*.npy" | wc -l
+
+echo "=== succgrasp ==="
+find output/collect_data_shadow/succgrasp -name "*.npy" | wc -l
+
+echo "=== 体积 ==="
+du -sh output/collect_data_shadow/dataset
+
+echo "=== 磁盘剩余 ==="
+df -h /home | tail -1
+```
+
+### 生成 index.json
+```bash
+conda activate dgbench
+cd ~/my_project/DexGraspBench
+
+python scripts/build_index.py \
+    --exp collect_data \
+    --success-only \
+    --out ~/my_project/data/index_data.json
+```
+
+### 生成 stats.json
+```bash
+python - << 'EOF'
+import json
+import numpy as np
+
+INDEX = '/home/chen/my_project/data/index_data.json'
+OUT = '/home/chen/my_project/data/stats_data.json'
+
+idx = json.load(open(INDEX))
+qpos_all, qfrc_all = [], []
+
+for e in idx['episodes']:
+    if e['split'] != 'train' or not e['success']:
+        continue
+    d = np.load(e['npz'], allow_pickle=True)
+    qpos_all.append(d['qpos_hand'])
+    qfrc_all.append(d['qfrc_hand'])
+
+qpos_all = np.concatenate(qpos_all)
+qfrc_all = np.concatenate(qfrc_all)
+
+stats = {
+    'qpos_mean': qpos_all.mean(0).tolist(),
+    'qpos_std': (qpos_all.std(0) + 1e-6).tolist(),
+    'qfrc_mean': qfrc_all.mean(0).tolist(),
+    'qfrc_std': (qfrc_all.std(0) + 1e-6).tolist(),
+    'n_train_frames': int(len(qpos_all)),
+}
+json.dump(stats, open(OUT, 'w'), indent=2)
+print(f"saved {OUT}")
+print(f"n_train_frames = {stats['n_train_frames']}")
+EOF
+```
+
+---
+
+
 ## 脚本使用简介
 
 本仓库在 DexGraspBench 基础上扩展了多模态数据可视化脚本。
@@ -78,3 +205,26 @@ python scripts/export_wrist_cam.py --exp collect_data
 
 ![wrist camera sequence](docs/wrist_cam_seq.gif)
         
+## References
+
+- **SoftGrasp paper**  
+  Li Y, Guo C, Ren J, Chen B, Cheng C, Zhang H, Lu H.  
+  *SoftGrasp: Adaptive Grasping Method for Dexterous Hand Based on Multimodal Imitation Learning.*  
+  Biomimetic Intelligence and Robotics, 2025, 100217.  
+  DOI: [10.1016/j.birob.2025.100217](https://doi.org/10.1016/j.birob.2025.100217)
+
+- **SoftGrasp code**  
+  https://github.com/nubot-nudt/SoftGrasp
+
+- **BODex dataset / code**  
+  Chen J, et al.  
+  *BODex: Scalable and Efficient Robotic Dexterous Grasp Synthesis Using Bilevel Optimization.*  
+  arXiv:2412.16441.  
+  GitHub: [https://github.com/JYChen18/BODex](https://github.com/JYChen18/BODex)  
+  Project page: [https://bodex-grasp.github.io/](https://bodex-grasp.github.io/)
+
+- **DexGraspBench**  
+  GitHub: [https://github.com/JYChen18/DexGraspBench](https://github.com/JYChen18/DexGraspBench)
+
+- **BODex assets / DGN_2k processed data**  
+  见 BODex 仓库说明与 `DGN_2k_processed.zip` 下载页。
