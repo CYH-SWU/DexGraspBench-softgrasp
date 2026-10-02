@@ -10,14 +10,7 @@ import transforms3d.quaternions as tq
 from .rot_util import interplote_pose, interplote_qpos
 
 
-# ====================================================================
-# 模块级工具函数
-# ====================================================================
 def camera_look_at(pos, target=(0.0, 0.0, 0.0), world_up=(0.0, 0.0, 1.0)):
-    """返回 (pos, xyaxes)，让相机从 pos 看向 target。
-
-    MuJoCo 相机沿自身 -z 轴看。z 轴 = x × y。
-    """
     pos = np.asarray(pos, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
     world_up = np.asarray(world_up, dtype=np.float64)
@@ -36,7 +29,6 @@ def camera_look_at(pos, target=(0.0, 0.0, 0.0), world_up=(0.0, 0.0, 1.0)):
 
 
 def quat_slerp(q1, q2, t):
-    """四元数球面线性插值。q 格式 [w, x, y, z]。"""
     q1 = np.asarray(q1, dtype=np.float64)
     q2 = np.asarray(q2, dtype=np.float64)
 
@@ -63,7 +55,6 @@ def quat_slerp(q1, q2, t):
 
 
 def s_curve(t, T, kind="quintic"):
-    """归一化 S 曲线：s(0)=0, s(T)=1。"""
     if t <= 0:
         return 0.0
     if t >= T:
@@ -77,9 +68,6 @@ def s_curve(t, T, kind="quintic"):
         raise ValueError(f"Unknown S-curve kind: {kind}")
 
 
-# ====================================================================
-# MjHO
-# ====================================================================
 class MjHO:
 
     hand_prefix: str = "child-"
@@ -119,26 +107,7 @@ class MjHO:
                 castshadow=False,
             )
 
-            # ---------- 4 相机环绕 ----------
-            RADIUS = 0.6
-            HEIGHT = 0.4
-            TARGET = [0.0, 0.0, 0.0]
-
-            self.cam_names = ["cam_front", "cam_right", "cam_back", "cam_left"]
-            for name, deg in zip(self.cam_names, [0, 90, 180, 270]):
-                theta = np.radians(deg)
-                pos = [RADIUS * np.cos(theta), RADIUS * np.sin(theta), HEIGHT]
-                pos, xyaxes = camera_look_at(pos, target=TARGET)
-                self.spec.worldbody.add_camera(
-                    name=name, pos=pos, xyaxes=xyaxes, fovy=60,
-                )
-
-            # 保留原 closeup（斜上视角）
-            self.spec.worldbody.add_camera(
-                name="closeup",
-                pos=[0.75, 1.0, 1.0],
-                xyaxes=[-1, 0, 0, 0, -1, 1],
-            )
+            self.cam_names = ["wrist_cam"]
         else:
             self.cam_names = []
 
@@ -153,14 +122,12 @@ class MjHO:
                     bodyname2=f"{self.hand_prefix}{body_name}",
                 )
 
-        # Get ready for simulation
         self.model = self.spec.compile()
         self.data = mujoco.MjData(self.model)
 
         mujoco.mj_resetDataKeyframe(self.model, self.data, 0)
         mujoco.mj_forward(self.model, self.data)
 
-        # For ctrl
         qpos2ctrl_matrix = np.zeros((self.model.nu, self.model.nv))
         mujoco.mju_sparse2dense(
             qpos2ctrl_matrix,
@@ -174,9 +141,6 @@ class MjHO:
         self.debug_viewer = None
         self.debug_render = None
 
-        # ------------------------------------------------------------------
-        # 实时 viewer
-        # ------------------------------------------------------------------
         if debug_viewer:
             self.debug_viewer = mujoco.viewer.launch_passive(self.model, self.data)
             with self.debug_viewer.lock():
@@ -190,11 +154,8 @@ class MjHO:
                 opt.flags[mujoco.mjtVisFlag.mjVIS_COM] = False
             self.debug_viewer.sync()
 
-        # ------------------------------------------------------------------
-        # 离屏渲染
-        # ------------------------------------------------------------------
         if debug_render:
-            self.debug_render = mujoco.Renderer(self.model, 480, 640)
+            self.debug_render = mujoco.Renderer(self.model, 320, 320)
             self.debug_options = mujoco.MjvOption()
             mujoco.mjv_defaultOption(self.debug_options)
             self.debug_options.geomgroup[:] = [1, 1, 1, 0, 0, 0]
@@ -204,7 +165,6 @@ class MjHO:
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_JOINT] = False
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_ACTUATOR] = False
             self.debug_options.flags[mujoco.mjtVisFlag.mjVIS_COM] = False
-            # ★ 改成 dict，每路一个 list
             self.debug_images = {name: [] for name in self.cam_names}
         return
 
@@ -230,9 +190,6 @@ class MjHO:
         except Exception:
             pass
 
-    # ==================================================================
-    # 场景构建
-    # ==================================================================
     def _add_hand(self, xml_path, mocap_base):
         child_spec = mujoco.MjSpec.from_file(xml_path)
         for m in child_spec.meshes:
@@ -258,6 +215,27 @@ class MjHO:
                 solimp=[0.9, 0.95, 0.001, 0.5, 2],
                 data=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             )
+
+        def _find_body(parent, suffix):
+            for b in parent.bodies:
+                if (b.name or "").endswith(suffix):
+                    return b
+                r = _find_body(b, suffix)
+                if r is not None:
+                    return r
+            return None
+
+        palm_body = _find_body(child_world, "rh_palm")
+        if palm_body is not None:
+            palm_body.add_camera(
+                name="wrist_cam",
+                pos=[0.0, -0.25, 0.10],
+                xyaxes=[1,0,0, 0,0,1],
+                fovy=60,
+            )
+            print(f"[INFO] wrist_cam 已挂在 {palm_body.name}")
+        else:
+            print("[WARN] 找不到 rh_palm，wrist_cam 未添加")
         return
 
     def _add_object(self, obj_path, obj_scale, obj_density, has_floor_z0):
@@ -310,9 +288,6 @@ class MjHO:
             g.condim = 4
         return
 
-    # ==================================================================
-    # 状态访问
-    # ==================================================================
     def _qpos2ctrl(self, hand_qpos):
         if self.hand_mocap:
             return self._qpos2ctrl_matrix[:, 6:] @ hand_qpos[7:]
@@ -399,14 +374,7 @@ class MjHO:
         mujoco.mj_forward(self.model, self.data)
         return
 
-    # ==================================================================
-    # 渲染
-    # ==================================================================
     def _render_all_cameras(self):
-        """渲染所有 cam_names 里的相机，返回 {cam_name: HxWx3 uint8}。
-
-        无 debug_render 时返回 None。
-        """
         if self.debug_render is None:
             return None
         frames = {}
@@ -415,9 +383,6 @@ class MjHO:
             frames[cam_name] = self.debug_render.render().copy()
         return frames
 
-    # ==================================================================
-    # 控制
-    # ==================================================================
     def control_hand_with_interp(
         self, hand_qpos1, hand_qpos2, step_outer=10, step_inner=10
     ):
@@ -456,7 +421,6 @@ class MjHO:
                 except Exception:
                     self.debug_viewer = None
 
-        # 离屏渲染（多路）
         frames = self._render_all_cameras()
         if frames is not None:
             for cam_name, frame in frames.items():
@@ -473,13 +437,6 @@ class MjHO:
         phase_name="",
         realtime_factor=1.0,
     ):
-        """S 曲线在 hand_qpos1 → hand_qpos2 之间平滑过渡（qpos 空间）。
-
-        realtime_factor:
-            1.0  → 实时（1 秒仿真对应 1 秒墙钟）
-            0.5  → 2 倍慢放
-            0.0  → 不限速（批量采集用，最快）
-        """
         dt = self.model.opt.timestep
         n_steps = max(2, int(round(duration / dt)))
 
@@ -507,20 +464,17 @@ class MjHO:
             mujoco.mj_forward(self.model, self.data)
             mujoco.mj_step(self.model, self.data)
 
-            # ★ 先问 recorder：本步是否需要采样（避免 250Hz 渲染）
             need_render = False
             if record_hook is not None and self.debug_render is not None:
                 if hasattr(record_hook, "should_sample"):
                     need_render = record_hook.should_sample(self)
                 else:
-                    # 非 recorder 的 hook，保守每步都渲染
                     need_render = getattr(record_hook, "recording", True)
 
             frames = None
             if need_render:
                 frames = self._render_all_cameras()
 
-            # ★ 传给 record_hook
             if record_hook is not None:
                 record_hook(
                     t=t, s=s, mj_ho=self,
@@ -528,7 +482,6 @@ class MjHO:
                     frames=frames,
                 )
 
-            # viewer 同步 + 限速
             v = self.debug_viewer
             if v is not None:
                 try:
@@ -548,9 +501,6 @@ class MjHO:
         return
 
 
-# ====================================================================
-# RobotKinematics
-# ====================================================================
 class RobotKinematics:
     def __init__(self, xml_path):
         spec = mujoco.MjSpec.from_file(xml_path)

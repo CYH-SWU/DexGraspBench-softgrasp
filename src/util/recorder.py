@@ -21,7 +21,7 @@ class GraspRecorder:
 
     def start(self):
         self.recording = True
-        self.last_t = -1e9      # 让下一帧立刻被采
+        self.last_t = -1e9
         print(f"[Recorder] START  recording")
 
     def stop(self):
@@ -29,7 +29,6 @@ class GraspRecorder:
         print(f"[Recorder] STOP   recording  (buffered {len(self.buf['t'])} frames)")
 
     def should_sample(self, mj_ho):
-        """纯查询：本步是否应该采样。不改 last_t。"""
         if not self.recording:
             return False
         t_global = float(mj_ho.data.time)
